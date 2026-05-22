@@ -1,0 +1,112 @@
+{
+  "id": "tpHlIsVmaSBf1R5b",
+  "name": "Forms - Store and Notify - Google Sheets and Telegram",
+  "active": false,
+  "isArchived": false,
+  "versionId": "2392c635-96b3-4008-9a1c-26fcd62807e6",
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": true
+  },
+  "connections": {
+    "Google Form Submission": {
+      "main": [[{"node": "Extract Form Fields", "type": "main", "index": 0}]]
+    },
+    "Extract Form Fields": {
+      "main": [[{"node": "Store in Google Sheets", "type": "main", "index": 0}]]
+    },
+    "Store in Google Sheets": {
+      "main": [[{"node": "Send Telegram Notification", "type": "main", "index": 0}]]
+    },
+    "Send Telegram Notification": {
+      "main": [[{"node": "Log Execution Status", "type": "main", "index": 0}]]
+    }
+  },
+  "nodes": [
+    {
+      "id": "456a3cb2-489d-4460-8f2d-96c0ff209e39",
+      "name": "Google Form Submission",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [0, 0],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "google-form-submission",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "webhookId": "4b61c8e4-5934-4fb9-8371-c4243a195d39"
+    },
+    {
+      "id": "400c95c0-60c8-44d7-a44a-27c8f38bb28b",
+      "name": "Extract Form Fields",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [224, 0],
+      "parameters": {
+        "mode": "manual",
+        "assignments": {
+          "assignments": [
+            {"id": "f1", "name": "name", "value": "={{ $json.body.name || $json.body['Name'] || 'N/A' }}", "type": "string"},
+            {"id": "f2", "name": "email", "value": "={{ $json.body.email || $json.body['Email'] || 'N/A' }}", "type": "string"},
+            {"id": "f3", "name": "message", "value": "={{ $json.body.message || $json.body['Message'] || 'N/A' }}", "type": "string"},
+            {"id": "f4", "name": "submittedAt", "value": "={{ $json.body.timestamp || $now }}", "type": "string"}
+          ]
+        },
+        "includeOtherFields": false
+      }
+    },
+    {
+      "id": "7471c9aa-ba9b-4c21-8625-14f16d3f04bf",
+      "name": "Store in Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [448, 0],
+      "parameters": {
+        "resource": "sheet",
+        "operation": "append",
+        "documentId": {"__rl": true, "mode": "id", "value": "YOUR_SPREADSHEET_ID"},
+        "sheetName": {"__rl": true, "mode": "name", "value": "Form Responses"},
+        "columns": "={{ { \"mappingMode\": \"autoMapInputData\", \"value\": null } }}",
+        "options": {"cellFormat": "USER_ENTERED"}
+      }
+    },
+    {
+      "id": "5b59db77-64f6-421a-8abe-6c6c0d950588",
+      "name": "Send Telegram Notification",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [672, 0],
+      "parameters": {
+        "resource": "message",
+        "operation": "sendMessage",
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "={{ '\ud83c\udd95 New Google Form Submission\\n\\n\ud83d\udc64 Name: ' + $('Extract Form Fields').item.json.name + '\\n\ud83d\udce7 Email: ' + $('Extract Form Fields').item.json.email + '\\n\ud83d\udcac Message: ' + $('Extract Form Fields').item.json.message + '\\n\ud83d\udd50 Submitted: ' + $('Extract Form Fields').item.json.submittedAt }}",
+        "additionalFields": {"parse_mode": "HTML", "appendAttribution": false}
+      }
+    },
+    {
+      "id": "85a7d60e-eaf8-46a5-b6b5-38e7d33a5802",
+      "name": "Log Execution Status",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [896, 0],
+      "parameters": {
+        "mode": "manual",
+        "assignments": {
+          "assignments": [
+            {"id": "l1", "name": "status", "value": "SUCCESS", "type": "string"},
+            {"id": "l2", "name": "executedAt", "value": "={{ $now }}", "type": "string"},
+            {"id": "l3", "name": "submitter", "value": "={{ $('Extract Form Fields').item.json.name }}", "type": "string"},
+            {"id": "l4", "name": "sheetsRowAppended", "value": true, "type": "boolean"},
+            {"id": "l5", "name": "telegramNotified", "value": true, "type": "boolean"},
+            {"id": "l6", "name": "workflowName", "value": "Forms - Store and Notify - Google Sheets and Telegram", "type": "string"}
+          ]
+        },
+        "includeOtherFields": false
+      }
+    }
+  ],
+  "description": "Receives Google Form submissions via webhook, stores responses in Google Sheets, sends Telegram notification, and logs execution status.",
+  "meta": {"aiBuilderAssisted": true, "builderVariant": "mcp"}
+}
