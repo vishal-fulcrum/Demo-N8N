@@ -1,0 +1,637 @@
+# =============================================================================
+# COE Asset Registry — PR Lifecycle Tracker (Fulcrum)
+# Version: 3.0 (from coe-pr-lifecycle-tracker-v3.yml)
+# Deploy to: flcrm-ai/fulcrum-coe-n8n-workflows
+#   → .github/workflows/coe-pr-lifecycle-tracker.yml
+# Secrets (repo Settings → Actions): PG_CONNECTION_STRING, N8N_API_URL, N8N_API_KEY
+#   (values only in GitHub — never commit secrets in this file)
+# Aligned: PRD v1.6 (BR-06), TRD v1.2 (TR-09), schema v5
+# =============================================================================
+#
+# Tracks PR lifecycle events into coe_asset_registry on Supabase / GCP Cloud SQL.
+# This Action owns pipeline_status, all PR/review fields, and approved content.
+# Claude's MCP wrapper owns draft-phase fields. The two never overlap.
+#
+# ── Event → Job mapping ────────────────────────────────────────────────────────
+#
+#   1. PR opened / reopened
+#      └─ UPSERT → pipeline_status = 'submitted'
+#         Writes: github_branch, github_pr_url, github_pr_number,
+#                 pr_raised_by, submitted_at
+#
+#   2. PR review submitted (approved or changes_requested)
+#      └─ UPDATE → pipeline_status = 'under_review' | 'rework_requested'
+#         Writes: reviewed_by, review_notes, gates_passed_at
+#
+#         V1 NOTE — gates_passed_at semantics:
+#         Per TRD line 167, gates_passed_at should mark when CI/CD gates pass
+#         (submitted → under_review trigger). In V1 there are no separate CI/CD
+#         gate events wired up, so reviewer approval is used as the proxy.
+#         gates_passed_at = reviewer approval timestamp in V1.
+#         In V2, wire a check_suite completed event to set this correctly before
+#         the human reviewer ever sees the PR.
+#
+#   3. PR merged
+#      └─ UPDATE → pipeline_status = 'approved'
+#         Writes: pr_merged, approved_at, reviewed_by (fallback),
+#                 workflow_json, context_doc, testing_report_doc, mermaid_source
+#
+#         Then: calls n8n REST API to activate the workflow (per PRD BR-06 /
+#         TRD TR-09). Sets operational_status and n8n_activated based on whether
+#         the n8n API call succeeds or fails:
+#           success → operational_status = 'active',   n8n_activated = TRUE
+#           failure → operational_status = 'inactive', n8n_activated = FALSE
+#                     (asset stays approved; error logged; retry manually)
+#
+# ── Lookup strategy ───────────────────────────────────────────────────────────
+#   Job 1 (PR open): UPSERT by asset_name parsed from PR title
+#   Jobs 2 & 3:      UPDATE by github_pr_number (indexed, written in Job 1)
+#
+# ── PR title convention (REQUIRED) ───────────────────────────────────────────
+#   All COE workflow PRs MUST use the title format: "Publish: <asset_name>"
+#   e.g. "Publish: fathom_to_slack"
+#   Without this prefix, asset_name is derived from the raw title which may
+#   not match the registered asset_name in the DB.
+#   Enforce this with a branch protection PR title regex rule if possible.
+#
+# ── PR body conventions (used for fallback INSERT) ───────────────────────────
+#   **n8n Workflow ID:** <id>          ← used if asset not pre-registered by Claude
+#   **Submitted by:** Name (email)     ← used if asset not pre-registered by Claude
+#
+# ── Required GitHub secrets ───────────────────────────────────────────────────
+#   PG_CONNECTION_STRING  — full Postgres connection URL (Supabase session pooler)
+#   N8N_API_URL           — n8n instance API base URL e.g. https://n8n.host/api/v1
+#   N8N_API_KEY           — n8n API key (from Settings > n8n API)
+#   (set in repo Settings → Secrets and variables → Actions → New repository secret)
+#
+# ── V1 known gaps (not blocking demo) ────────────────────────────────────────
+#   - mermaid_svg is not generated (server-side Mermaid render is a V2 task).
+#     mermaid_source is extracted from context.md and stored; SVG stays NULL.
+#   - gates_passed_at uses reviewer approval as proxy (see Job 2 note above).
+#   - No check_suite / CI gate event trigger — add in V2 when CI gates are live.
+#
+# ── Fix log ───────────────────────────────────────────────────────────────────
+#   v2.0.1 — Fixed "inconsistent types deduced for parameter $1" in Job 2 and
+#            Job 3 by adding explicit ::text casts on all parameterized ENUM
+#            column assignments. PostgreSQL cannot infer the type of $N params
+#            against ENUM columns without an explicit cast.
+#            Changed lines: Job 2 pipeline_status=$1 → $1::text (×2),
+#                           Job 3 operational_status=$1 → $1::text
+# =============================================================================
+
+name: COE Asset Registry — PR Lifecycle Tracker
+
+on:
+  pull_request:
+    types: [opened, reopened, closed]
+    branches: [main]
+    paths:
+      - 'workflows/**'
+  pull_request_review:
+    types: [submitted]
+
+
+# =============================================================================
+# JOB 1 — PR opened / reopened  →  pipeline_status = 'submitted'
+# =============================================================================
+jobs:
+  on-pr-opened:
+    name: "Registry: mark submitted"
+    if: >-
+      github.event_name == 'pull_request' &&
+      (github.event.action == 'opened' || github.event.action == 'reopened')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install pg client library
+        run: npm install pg
+
+      - name: Upsert registry row → submitted
+        env:
+          PG_CONNECTION_STRING: ${{ secrets.PG_CONNECTION_STRING }}
+          PR_TITLE:      ${{ github.event.pull_request.title }}
+          PR_BRANCH:     ${{ github.event.pull_request.head.ref }}
+          PR_URL:        ${{ github.event.pull_request.html_url }}
+          PR_NUMBER:     ${{ github.event.pull_request.number }}
+          PR_AUTHOR:     ${{ github.event.pull_request.user.login }}
+          PR_CREATED_AT: ${{ github.event.pull_request.created_at }}
+          # PR_BODY passed via env (not inline) to avoid shell injection from
+          # user-controlled PR body content.
+          PR_BODY: ${{ github.event.pull_request.body }}
+
+        run: |
+          node << 'SCRIPT'
+          (async () => {
+            const { Client } = require('pg');
+
+            const prTitle  = process.env.PR_TITLE  || '';
+            const prBody   = process.env.PR_BODY   || '';
+            const prAuthor = process.env.PR_AUTHOR || 'unknown';
+
+            // ── Asset name ────────────────────────────────────────────────
+            // PR title MUST follow the convention "Publish: <asset_name>".
+            // If the prefix is absent, the raw title is used as asset_name.
+            // This may fail to match a pre-registered row — enforce the
+            // "Publish: " prefix via branch protection PR title rules.
+            const assetName = prTitle.startsWith('Publish: ')
+              ? prTitle.slice(9).trim()
+              : prTitle.trim();
+
+            // ── n8n Workflow ID ───────────────────────────────────────────
+            // Only used in the fallback INSERT path (asset not pre-registered
+            // by Claude). If Claude registered the asset via MCP, n8n_workflow_id
+            // is already in the DB and the ON CONFLICT clause leaves it untouched.
+            // PR body line: **n8n Workflow ID:** cXBOQCYvOSK0b77n
+            const wfIdMatch     = prBody.match(/\*\*n8n Workflow ID:\*\*\s*(\S+)/);
+            const n8nWorkflowId = wfIdMatch ? wfIdMatch[1] : null;
+
+            // ── Submitter name + email ────────────────────────────────────
+            // Only used in the fallback INSERT path (asset not pre-registered).
+            // PR body line: **Submitted by:** Vishal Mishra (vishal.mishra@fulcrum.com)
+            // V1 NOTE: tool_used defaults to 'claude' in the fallback INSERT.
+            // If the asset was built with a different tool, this will be wrong.
+            // The correct value is always set by Claude's MCP register_asset call
+            // before the PR is raised — the fallback only fires for assets that
+            // skipped MCP registration entirely.
+            const submitterMatch = prBody.match(
+              /\*\*Submitted by:\*\*\s*([^(\n]+?)(?:\s*\(([^)]+)\))?(?:\n|$)/
+            );
+            const ownerName  = submitterMatch ? submitterMatch[1].trim() : prAuthor;
+            const ownerEmail = (submitterMatch && submitterMatch[2])
+              ? submitterMatch[2].trim()
+              : `${prAuthor}@github.com`;
+
+            // ── Description fallback (max 250 chars per ck_description_length)
+            // Only used in the fallback INSERT path. Pre-registered assets
+            // already have a proper description from Claude's MCP registration.
+            const description = `PR #${process.env.PR_NUMBER} — ${assetName}`.slice(0, 250);
+
+            const client = new Client({ connectionString: process.env.PG_CONNECTION_STRING });
+            await client.connect();
+
+            // ── UPSERT logic ──────────────────────────────────────────────
+            //
+            // Happy path (asset pre-registered by Claude via MCP):
+            //   ON CONFLICT fires → UPDATE pipeline fields only.
+            //   Claude's values for asset_type, tool_used, description,
+            //   owner_name, owner_email, business_unit, n8n_workflow_id
+            //   are preserved — NOT overwritten.
+            //
+            // Fallback path (PR raised without prior MCP registration):
+            //   No conflict → INSERT a minimal row with conservative defaults
+            //   so Jobs 2 and 3 have a row to UPDATE.
+            //   asset_type defaults to 'n8n_workflow' (workflows/ path implies n8n).
+            //   tool_used  defaults to 'claude' (most common; may be incorrect).
+            //   business_unit defaults to 'fulcrum' (fallback INSERT only).
+            const result = await client.query(
+              `
+              INSERT INTO coe_asset_registry (
+                asset_name,
+                asset_type,
+                tool_used,
+                description,
+                owner_name,
+                owner_email,
+                business_unit,
+                systems_touched,
+                credential_refs,
+                access_type,
+                pipeline_status,
+                github_branch,
+                github_pr_url,
+                github_pr_number,
+                pr_raised_by,
+                submitted_at,
+                n8n_workflow_id
+              ) VALUES (
+                $1,                -- asset_name
+                'n8n_workflow',    -- asset_type  (fallback default; workflows/ path implies n8n)
+                'claude',          -- tool_used   (fallback default; may be wrong — see V1 note above)
+                $2,                -- description (≤250 chars fallback)
+                $3,                -- owner_name
+                $4,                -- owner_email
+                'fulcrum',         -- business_unit (fallback default for Fulcrum org)
+                '{}',              -- systems_touched (empty; populated by Claude's MCP registration)
+                '[]',              -- credential_refs (empty JSON array)
+                'read-only',       -- access_type    (conservative fallback default)
+                'submitted',       -- pipeline_status
+                $5,                -- github_branch
+                $6,                -- github_pr_url
+                $7,                -- github_pr_number
+                $8,                -- pr_raised_by
+                $9::timestamptz,   -- submitted_at
+                $10                -- n8n_workflow_id (from PR body; NULL if not found)
+              )
+              ON CONFLICT (asset_name) DO UPDATE SET
+                -- Pipeline fields updated on every open/reopen.
+                -- All Claude-written fields (asset_type, tool_used, description,
+                -- owner_name, owner_email, business_unit, n8n_workflow_id)
+                -- are intentionally excluded — preserved from MCP registration.
+                pipeline_status  = 'submitted',
+                github_branch    = EXCLUDED.github_branch,
+                github_pr_url    = EXCLUDED.github_pr_url,
+                github_pr_number = EXCLUDED.github_pr_number,
+                pr_raised_by     = EXCLUDED.pr_raised_by,
+                submitted_at     = EXCLUDED.submitted_at
+              RETURNING asset_name, id, (xmax = 0) AS was_inserted
+              `,
+              [
+                assetName,                                 // $1
+                description,                               // $2
+                ownerName,                                 // $3
+                ownerEmail,                                // $4
+                process.env.PR_BRANCH,                    // $5
+                process.env.PR_URL,                        // $6
+                parseInt(process.env.PR_NUMBER, 10),      // $7
+                prAuthor,                                  // $8
+                process.env.PR_CREATED_AT,                // $9
+                n8nWorkflowId,                            // $10
+              ]
+            );
+
+            await client.end();
+
+            const row       = result.rows[0];
+            const wasInsert = row.was_inserted;
+            console.log(`✅ [PR #${process.env.PR_NUMBER}] "${row.asset_name}" → submitted`);
+            console.log(`   Row ${wasInsert ? 'INSERTED (fallback — asset was not pre-registered by Claude)' : 'UPDATED (pre-registered by Claude MCP)'}`);
+            console.log(`   ID: ${row.id}`);
+            console.log(`   Raised by: ${prAuthor} | Owner: ${ownerName} <${ownerEmail}>`);
+            console.log(`   n8n Workflow ID: ${n8nWorkflowId || '(not found in PR body — check MCP registration)'}`);
+          })().catch(err => {
+            console.error('❌ Registry update failed:', err.message);
+            process.exit(1);
+          });
+          SCRIPT
+
+
+# =============================================================================
+# JOB 2 — PR review submitted  →  'under_review' | 'rework_requested'
+# =============================================================================
+  on-pr-reviewed:
+    name: "Registry: record review"
+    if: github.event_name == 'pull_request_review'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install pg client library
+        run: npm install pg
+
+      - name: Update registry row → under_review / rework_requested
+        env:
+          PG_CONNECTION_STRING: ${{ secrets.PG_CONNECTION_STRING }}
+          PR_NUMBER:    ${{ github.event.pull_request.number }}
+          REVIEWER:     ${{ github.event.review.user.login }}
+          REVIEW_STATE: ${{ github.event.review.state }}
+          # review.body can be null when reviewer submits without a comment.
+          REVIEW_BODY:  ${{ github.event.review.body }}
+          REVIEWED_AT:  ${{ github.event.review.submitted_at }}
+
+        run: |
+          node << 'SCRIPT'
+          (async () => {
+            const { Client } = require('pg');
+
+            const reviewState = process.env.REVIEW_STATE || '';
+            const prNumber    = parseInt(process.env.PR_NUMBER, 10);
+
+            // Only act on reviews that carry a decision.
+            // 'commented' state does not change pipeline_status.
+            if (!['approved', 'changes_requested'].includes(reviewState)) {
+              console.log(`ℹ️  Review state "${reviewState}" — no registry update needed.`);
+              process.exit(0);
+            }
+
+            // ── Pipeline status mapping ───────────────────────────────────
+            //   approved          → under_review
+            //   changes_requested → rework_requested
+            //
+            // V1 NOTE — 'under_review' timing:
+            // Per the PRD/TRD, the correct flow is:
+            //   submitted → under_review (CI gates pass) → approved (reviewer approves)
+            // In V1 there are no CI gate events wired up, so reviewer approval is
+            // used as the proxy for both gate pass and review start.
+            // The result is that 'under_review' is set at the same moment the
+            // reviewer has already approved — which is semantically later than ideal.
+            // This will be corrected in V2 by adding a check_suite completed trigger
+            // that sets under_review before any human reviewer acts.
+            const newStatus = reviewState === 'approved'
+              ? 'under_review'
+              : 'rework_requested';
+
+            const client = new Client({ connectionString: process.env.PG_CONNECTION_STRING });
+            await client.connect();
+
+            // FIX v2.0.1: Added ::text cast on $1 to avoid "inconsistent types
+            // deduced for parameter $1" error when pipeline_status is an ENUM
+            // or CHECK-constrained TEXT column. PostgreSQL cannot infer the type
+            // of a parameterized value against ENUM columns without an explicit cast.
+            const result = await client.query(
+              `
+              UPDATE coe_asset_registry SET
+                pipeline_status = $1::text,
+                reviewed_by     = $2,
+                review_notes    = $3,
+                -- gates_passed_at: marks when the asset entered under_review.
+                -- V1 NOTE: set to reviewer approval timestamp as a proxy for
+                -- CI gate completion. Only written once — never overwritten on
+                -- subsequent reviews of the same PR (CASE preserves existing value).
+                -- In V2 this moves to a check_suite completed event trigger.
+                gates_passed_at = CASE
+                  WHEN $1::text = 'under_review' AND gates_passed_at IS NULL
+                  THEN $4::timestamptz
+                  ELSE gates_passed_at
+                END
+              WHERE github_pr_number = $5
+              RETURNING asset_name, id
+              `,
+              [
+                newStatus,                                // $1
+                process.env.REVIEWER,                    // $2
+                process.env.REVIEW_BODY || null,         // $3 (null if blank)
+                process.env.REVIEWED_AT,                 // $4
+                prNumber,                                 // $5
+              ]
+            );
+
+            await client.end();
+
+            if (result.rowCount === 0) {
+              // PR was opened before this action was deployed, or targets a
+              // non-workflow path. Not a hard failure — log and skip.
+              console.warn(
+                `⚠️  No registry row found for PR #${prNumber}.\n` +
+                `   Was this PR opened before the action was deployed?`
+              );
+            } else {
+              const { asset_name, id } = result.rows[0];
+              console.log(`✅ [PR #${prNumber}] "${asset_name}" → ${newStatus}`);
+              console.log(`   Reviewed by: ${process.env.REVIEWER}`);
+              console.log(`   ID: ${id}`);
+              if (process.env.REVIEW_BODY) {
+                console.log(`   Notes: ${process.env.REVIEW_BODY.slice(0, 120)}...`);
+              }
+            }
+          })().catch(err => {
+            console.error('❌ Registry update failed:', err.message);
+            process.exit(1);
+          });
+          SCRIPT
+
+
+# =============================================================================
+# JOB 3 — PR merged  →  approved + docs ingested + n8n activation attempted
+# =============================================================================
+  on-pr-merged:
+    name: "Registry: mark approved + ingest docs + activate n8n"
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.action == 'closed' &&
+      github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    steps:
+      # Check out the merge commit so we can read the committed files.
+      - name: Checkout merged commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+
+      - name: Install pg client library
+        run: npm install pg
+
+      - name: Read committed files + update registry → approved + activate n8n
+        env:
+          PG_CONNECTION_STRING: ${{ secrets.PG_CONNECTION_STRING }}
+          N8N_API_URL:  ${{ secrets.N8N_API_URL }}
+          N8N_API_KEY:  ${{ secrets.N8N_API_KEY }}
+          PR_TITLE:     ${{ github.event.pull_request.title }}
+          PR_NUMBER:    ${{ github.event.pull_request.number }}
+          PR_MERGED_AT: ${{ github.event.pull_request.merged_at }}
+          MERGED_BY:    ${{ github.event.pull_request.merged_by.login }}
+
+        run: |
+          node << 'SCRIPT'
+          (async () => {
+            const { Client } = require('pg');
+            const fs   = require('fs');
+            const path = require('path');
+            const https = require('https');
+            const http  = require('http');
+
+            const prTitle  = process.env.PR_TITLE || '';
+            const prNumber = parseInt(process.env.PR_NUMBER, 10);
+            const mergedAt = process.env.PR_MERGED_AT;
+            const mergedBy = process.env.MERGED_BY || 'unknown';
+
+            // ── Derive file paths from asset name ─────────────────────────
+            // PR title: "Publish: fathom_to_slack"
+            // → asset_name: "fathom_to_slack"
+            // → kebab:      "fathom-to-slack"
+            // → files:
+            //     workflows/fathom-to-slack.json
+            //     workflows/fathom-to-slack/context.md
+            //     workflows/fathom-to-slack/testing-report.md
+            const assetName = prTitle.startsWith('Publish: ')
+              ? prTitle.slice(9).trim()
+              : prTitle.trim();
+
+            const kebab = assetName
+              .toLowerCase()
+              .replace(/[^a-z0-9]+/g, '-')
+              .replace(/^-|-$/g, '');
+
+            const jsonPath    = path.join('workflows', `${kebab}.json`);
+            const contextPath = path.join('workflows', kebab, 'context.md');
+            const reportPath  = path.join('workflows', kebab, 'testing-report.md');
+
+            // ── Read committed files ──────────────────────────────────────
+            const workflowJson = fs.existsSync(jsonPath)
+              ? JSON.parse(fs.readFileSync(jsonPath, 'utf8'))
+              : null;
+
+            const contextDoc = fs.existsSync(contextPath)
+              ? fs.readFileSync(contextPath, 'utf8')
+              : null;
+
+            const testingReport = fs.existsSync(reportPath)
+              ? fs.readFileSync(reportPath, 'utf8')
+              : null;
+
+            // ── Extract Mermaid source from context.md ────────────────────
+            // Looks for a ```mermaid ... ``` block inside context.md.
+            // mermaid_source is stored as raw .mmd text.
+            //
+            // V1 NOTE — mermaid_svg not generated:
+            // Server-side SVG rendering from mermaid_source is a V2 task.
+            // mermaid_svg remains NULL in V1. The portal renders the diagram
+            // client-side from mermaid_source using mermaid.js.
+            let mermaidSource = null;
+            if (contextDoc) {
+              const m = contextDoc.match(/```mermaid\r?\n([\s\S]*?)```/);
+              if (m) mermaidSource = m[1].trim();
+            }
+
+            console.log(`📁 Asset:   "${assetName}"  (kebab: ${kebab})`);
+            console.log(`📂 Files:   json=${!!workflowJson}  context=${!!contextDoc}  report=${!!testingReport}  mermaid=${!!mermaidSource}`);
+
+            // ── n8n activation ────────────────────────────────────────────
+            // Per PRD BR-06 / TRD TR-09: on reviewer approval the workflow is
+            // automatically promoted to the n8n environment.
+            // We call the n8n REST API here to activate the workflow.
+            //
+            // The registry reflects the actual outcome:
+            //   API success → operational_status = 'active',   n8n_activated = TRUE
+            //   API failure → operational_status = 'inactive', n8n_activated = FALSE
+            //                 asset stays approved; error logged; manual retry needed
+            //
+            // If N8N_API_URL or N8N_API_KEY secrets are not set, activation is
+            // skipped and operational_status defaults to 'inactive'.
+
+            let activationSuccess = false;
+            let activationError   = null;
+
+            // Fetch the n8n_workflow_id from the registry first
+            // (needed to call the n8n activation endpoint)
+            const pgClient = new Client({ connectionString: process.env.PG_CONNECTION_STRING });
+            await pgClient.connect();
+
+            const lookupResult = await pgClient.query(
+              `SELECT n8n_workflow_id FROM coe_asset_registry WHERE github_pr_number = $1`,
+              [prNumber]
+            );
+
+            const n8nWorkflowId = lookupResult.rows[0]?.n8n_workflow_id || null;
+
+            if (!process.env.N8N_API_URL || !process.env.N8N_API_KEY) {
+              console.warn(`⚠️  N8N_API_URL or N8N_API_KEY not set — skipping n8n activation.`);
+              console.warn(`   operational_status will be set to 'inactive'. Activate manually in n8n.`);
+            } else if (!n8nWorkflowId) {
+              console.warn(`⚠️  n8n_workflow_id not found in registry for PR #${prNumber}.`);
+              console.warn(`   Was this asset registered via Claude MCP before the PR was raised?`);
+              console.warn(`   operational_status will be set to 'inactive'. Activate manually in n8n.`);
+            } else {
+              // Call n8n REST API: POST /workflows/{id}/activate
+              try {
+                const n8nUrl = `${process.env.N8N_API_URL.replace(/\/$/, '')}/workflows/${n8nWorkflowId}/activate`;
+                console.log(`🔌 Calling n8n activation API: ${n8nUrl}`);
+
+                await new Promise((resolve, reject) => {
+                  const url     = new URL(n8nUrl);
+                  const lib     = url.protocol === 'https:' ? https : http;
+                  const options = {
+                    hostname: url.hostname,
+                    port:     url.port || (url.protocol === 'https:' ? 443 : 80),
+                    path:     url.pathname,
+                    method:   'POST',
+                    headers: {
+                      'X-N8N-API-KEY': process.env.N8N_API_KEY,
+                      'Content-Type':  'application/json',
+                      'Content-Length': '0'
+                    }
+                  };
+                  const req = lib.request(options, (res) => {
+                    let body = '';
+                    res.on('data', chunk => body += chunk);
+                    res.on('end', () => {
+                      if (res.statusCode >= 200 && res.statusCode < 300) {
+                        resolve(body);
+                      } else {
+                        reject(new Error(`n8n API returned ${res.statusCode}: ${body}`));
+                      }
+                    });
+                  });
+                  req.on('error', reject);
+                  req.end();
+                });
+
+                activationSuccess = true;
+                console.log(`✅ n8n workflow ${n8nWorkflowId} activated successfully.`);
+              } catch (err) {
+                activationError = err.message;
+                console.error(`❌ n8n activation failed: ${err.message}`);
+                console.error(`   Asset will be set to 'approved' with operational_status = 'inactive'.`);
+                console.error(`   Retry activation manually in n8n or via the COE portal.`);
+              }
+            }
+
+            // ── Update the registry row ───────────────────────────────────
+            //
+            // Columns written here (per schema v5 write-ownership):
+            //   pipeline_status     → 'approved'                    (always)
+            //   operational_status  → 'active' or 'inactive'        (based on n8n API result)
+            //   pr_merged           → TRUE                           (always)
+            //   approved_at         → PR merged_at timestamp         (always)
+            //   n8n_activated       → TRUE or FALSE                  (based on n8n API result)
+            //   activated_at        → merged_at if activated, else NULL
+            //   workflow_json       → parsed JSON from workflows/<kebab>.json
+            //   context_doc         → content of context.md
+            //   testing_report_doc  → content of testing-report.md
+            //   mermaid_source      → extracted mermaid block from context.md
+            //   mermaid_svg         → NULL (V1 — server-side render deferred to V2)
+            //   reviewed_by         → fallback only (Job 2 should have set this already)
+            //
+            // Lookup key: github_pr_number (set in Job 1, indexed in schema)
+            const operationalStatus = activationSuccess ? 'active'  : 'inactive';
+            const n8nActivated      = activationSuccess ? true      : false;
+            const activatedAt       = activationSuccess ? mergedAt  : null;
+
+            // FIX v2.0.1: Added ::text cast on $1 (operational_status) to avoid
+            // "inconsistent types deduced for parameter $1" against ENUM columns.
+            const updateResult = await pgClient.query(
+              `
+              UPDATE coe_asset_registry SET
+                pipeline_status    = 'approved',
+                operational_status = $1::text,
+                pr_merged          = TRUE,
+                approved_at        = $2::timestamptz,
+                n8n_activated      = $3,
+                activated_at       = $4::timestamptz,
+                workflow_json      = $5::jsonb,
+                context_doc        = $6,
+                testing_report_doc = $7,
+                mermaid_source     = $8,
+                -- mermaid_svg intentionally left NULL in V1 (see note above)
+                -- reviewed_by: only set here if Job 2 never ran (fallback)
+                reviewed_by        = COALESCE(reviewed_by, $9)
+              WHERE github_pr_number = $10
+              RETURNING asset_name, id, n8n_workflow_id, reviewed_by
+              `,
+              [
+                operationalStatus,                                    // $1
+                mergedAt,                                             // $2
+                n8nActivated,                                         // $3
+                activatedAt,                                          // $4
+                workflowJson ? JSON.stringify(workflowJson) : null,  // $5
+                contextDoc,                                           // $6
+                testingReport,                                        // $7
+                mermaidSource,                                        // $8
+                mergedBy,                                             // $9 (reviewed_by fallback)
+                prNumber,                                             // $10
+              ]
+            );
+
+            await pgClient.end();
+
+            if (updateResult.rowCount === 0) {
+              console.error(
+                `❌ No registry row found for PR #${prNumber}.\n` +
+                `   The PR may have been opened before this action was deployed.`
+              );
+              process.exit(1);
+            }
+
+            const { asset_name, id, reviewed_by } = updateResult.rows[0];
+            console.log(`✅ [PR #${prNumber}] "${asset_name}" → approved`);
+            console.log(`   Registry ID:        ${id}`);
+            console.log(`   n8n Workflow ID:    ${n8nWorkflowId || '(not set)'}`);
+            console.log(`   operational_status: ${operationalStatus}${activationError ? ' ⚠️  (activation failed — see above)' : ''}`);
+            console.log(`   Reviewed by:        ${reviewed_by || '(not recorded — Job 2 may have been skipped)'}`);
+            console.log(`   Merged by:          ${mergedBy}`);
+            console.log(`   Approved at:        ${mergedAt}`);
+            console.log(`   Docs ingested:      json=${!!workflowJson}  context=${!!contextDoc}  report=${!!testingReport}  mermaid=${!!mermaidSource}`);
+          })().catch(err => {
+            console.error('❌ Registry update failed:', err.message);
+            process.exit(1);
+          });
+          SCRIPT
