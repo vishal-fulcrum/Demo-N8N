@@ -1,0 +1,86 @@
+{
+  "id": "AYp70kHaSYW80jus",
+  "name": "Monitoring - Alert Failed Transactions - Microsoft Teams",
+  "active": false,
+  "isArchived": false,
+  "versionId": "065087f9-9c2d-4cfd-9d83-1b1dbdf031de",
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": true
+  },
+  "connections": {
+    "Every 5 Minutes": {
+      "main": [[{"node": "Get Failed Transactions", "type": "main", "index": 0}]]
+    },
+    "Get Failed Transactions": {
+      "main": [[{"node": "Format Alert Message", "type": "main", "index": 0}]]
+    },
+    "Format Alert Message": {
+      "main": [[{"node": "Send Teams Alert", "type": "main", "index": 0}]]
+    }
+  },
+  "nodes": [
+    {
+      "id": "aa972139-b024-4863-9322-ab73196a151b",
+      "name": "Every 5 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [0, 0],
+      "parameters": {
+        "rule": {
+          "interval": [{"field": "minutes", "minutesInterval": 5}]
+        }
+      }
+    },
+    {
+      "id": "ed3b6b26-f73a-48f9-a993-a6b622cbf05c",
+      "name": "Get Failed Transactions",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [224, 0],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  id,\n  transaction_id,\n  amount,\n  currency,\n  status,\n  error_code,\n  error_message,\n  created_at,\n  account_id\nFROM transactions\nWHERE status = 'failed'\n  AND created_at >= NOW() - INTERVAL '5 minutes'\nORDER BY created_at DESC",
+        "options": {}
+      }
+    },
+    {
+      "id": "80b5340e-addb-4f3a-86b4-7734cb282cdf",
+      "name": "Format Alert Message",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [448, 0],
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": false,
+        "assignments": {
+          "assignments": [
+            {"id": "teams-message", "name": "teamsMessage", "value": "=\ud83d\udea8 **Failed Transaction Alert**\n\n**Transaction ID:** {{ $json.transaction_id }}\n**Account:** {{ $json.account_id }}\n**Amount:** {{ $json.currency }} {{ $json.amount }}\n**Error Code:** {{ $json.error_code }}\n**Error Message:** {{ $json.error_message }}\n**Failed At:** {{ $json.created_at }}\n**DB Record ID:** {{ $json.id }}", "type": "string"},
+            {"id": "transaction-id", "name": "transaction_id", "value": "={{ $json.transaction_id }}", "type": "string"},
+            {"id": "amount", "name": "amount", "value": "={{ $json.amount }}", "type": "number"},
+            {"id": "error-code", "name": "error_code", "value": "={{ $json.error_code }}", "type": "string"},
+            {"id": "failed-at", "name": "failed_at", "value": "={{ $json.created_at }}", "type": "string"}
+          ]
+        }
+      }
+    },
+    {
+      "id": "474ed25e-9630-40ab-ac6c-a69a50c5ad7b",
+      "name": "Send Teams Alert",
+      "type": "n8n-nodes-base.microsoftTeams",
+      "typeVersion": 1.1,
+      "position": [672, 0],
+      "parameters": {
+        "resource": "channelMessage",
+        "operation": "create",
+        "teamId": "YOUR_TEAM_ID",
+        "channelId": "YOUR_CHANNEL_ID",
+        "messageType": "html",
+        "message": "=<h3>\ud83d\udea8 Failed Transaction Alert</h3>\n<table>\n<tr><td><b>Transaction ID</b></td><td>{{ $json.transaction_id }}</td></tr>\n<tr><td><b>Amount</b></td><td>{{ $json.amount }}</td></tr>\n<tr><td><b>Error Code</b></td><td>{{ $json.error_code }}</td></tr>\n<tr><td><b>Failed At</b></td><td>{{ $json.failed_at }}</td></tr>\n</table>",
+        "options": {"includeLinkToWorkflow": false}
+      }
+    }
+  ],
+  "meta": {"aiBuilderAssisted": true, "builderVariant": "mcp"},
+  "description": "Polls PostgreSQL every 5 minutes for failed transactions and posts a formatted HTML alert card to a Microsoft Teams channel for each one found."
+}
