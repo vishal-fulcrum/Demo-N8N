@@ -1,0 +1,95 @@
+{
+  "id": "Wt30C2kiaMCvXCqX",
+  "name": "Social - Monitor Facebook Posts - WhatsApp & Gmail",
+  "active": false,
+  "isArchived": false,
+  "versionId": "4573f0ff-4be7-4f17-acc0-07a947dae995",
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": true
+  },
+  "connections": {
+    "Facebook Page Post Trigger": {
+      "main": [
+        [
+          {
+            "node": "WhatsApp Notify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "WhatsApp Notify": {
+      "main": [
+        [
+          {
+            "node": "Gmail Notify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "nodes": [
+    {
+      "id": "f4dd9dc1-9f83-4f7b-961a-708c6f7f6f2f",
+      "name": "Facebook Page Post Trigger",
+      "type": "n8n-nodes-base.facebookTrigger",
+      "typeVersion": 1,
+      "position": [0, 0],
+      "parameters": {
+        "appId": "YOUR_FACEBOOK_APP_ID",
+        "object": "page",
+        "fields": ["feed"],
+        "options": {
+          "includeValues": true
+        }
+      },
+      "webhookId": "2783c0e1-3e13-4d26-9ff2-4ef1f505b26c"
+    },
+    {
+      "id": "b43f04e0-92ff-406f-a666-c07c346080c5",
+      "name": "WhatsApp Notify",
+      "type": "n8n-nodes-base.whatsApp",
+      "typeVersion": 1.1,
+      "position": [224, 0],
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "messagingProduct": "whatsapp",
+        "phoneNumberId": "YOUR_WHATSAPP_PHONE_NUMBER_ID",
+        "recipientPhoneNumber": "YOUR_RECIPIENT_PHONE_NUMBER",
+        "messageType": "text",
+        "textBody": "=\ud83d\udd14 New Facebook Post!\n\n\ud83d\udcc4 Message: {{ $json.value?.item === \"post\" ? $json.value?.message ?? \"(no caption)\" : $json.value?.message ?? \"(no caption)\" }}\n\n\ud83d\udd52 Posted at: {{ $json.time ? new Date($json.time * 1000).toUTCString() : \"Unknown time\" }}\n\n\ud83d\udd17 View: https://facebook.com/{{ $json.value?.post_id ?? \"\" }}"
+      },
+      "webhookId": "d6b855ec-8400-4fb1-9808-214119860484"
+    },
+    {
+      "id": "16e23aec-d28b-4cab-88f8-d8c524ebf094",
+      "name": "Gmail Notify",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [448, 0],
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "authentication": "oAuth2",
+        "sendTo": "YOUR_EMAIL@gmail.com",
+        "subject": "=\ud83d\udce2 Facebook Post Update \u2014 {{ $json.value?.item ?? \"Activity\" }}",
+        "emailType": "html",
+        "message": "=<h2>\ud83d\udce2 New Facebook Page Post Detected</h2>\n<table border=\"0\" cellpadding=\"8\" style=\"font-family: Arial, sans-serif; font-size: 14px;\">\n  <tr><td><strong>\ud83d\udccb Type:</strong></td><td>{{ $json.value?.item ?? \"Unknown\" }}</td></tr>\n  <tr><td><strong>\ud83d\udcac Message:</strong></td><td>{{ $json.value?.message ?? \"(no message)\" }}</td></tr>\n  <tr><td><strong>\ud83d\udd52 Time:</strong></td><td>{{ $json.time ? new Date($json.time * 1000).toUTCString() : \"Unknown\" }}</td></tr>\n  <tr><td><strong>\ud83c\udd94 Post ID:</strong></td><td>{{ $json.value?.post_id ?? \"N/A\" }}</td></tr>\n  <tr><td><strong>\ud83d\udd17 Link:</strong></td><td><a href=\"https://facebook.com/{{ $json.value?.post_id ?? \"\" }}\">View on Facebook</a></td></tr>\n</table>\n<p style=\"color:#888;font-size:12px;\">This notification was sent automatically by your n8n Facebook Monitor workflow.</p>",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "webhookId": "8a58a4c3-622a-4b38-82f8-f22fc952aebc"
+    }
+  ],
+  "description": "Monitors a Facebook Page for new posts. When a post is published, sends a WhatsApp message and a Gmail notification with post details.",
+  "meta": {
+    "aiBuilderAssisted": true,
+    "builderVariant": "mcp"
+  }
+}
